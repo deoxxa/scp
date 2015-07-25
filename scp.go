@@ -11,8 +11,8 @@ import (
 	"strconv"
 	"time"
 
-	"code.google.com/p/go.crypto/ssh"
 	"github.com/kballard/go-shellquote"
+	"golang.org/x/crypto/ssh"
 )
 
 // Reader is a file being read from a remote host. It implements the io.Reader
