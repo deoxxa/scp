@@ -9,16 +9,18 @@ import (
 	"io/ioutil"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/kballard/go-shellquote"
 	"golang.org/x/crypto/ssh"
 )
 
-// Reader is a file being read from a remote host. It implements the io.Reader
-// and os.FileInfo interfaces, with the io.Reader portion delegated through to
-// a bufio.Reader.
-type Reader struct {
+// File is a file being read from or written to a remote host. It implements the
+// io.Reader and os.FileInfo interfaces, with the io.Reader portion delegated
+// through to a bufio.Reader in the case that this is a file being read from a
+// remote host.
+type File struct {
 	io.Reader
 
 	name string
@@ -26,34 +28,46 @@ type Reader struct {
 	mode os.FileMode
 }
 
+// NewFile constructs a new File object with the given parameters. The size must
+// be provided in advance because the remote host has to know how large the file
+// is, so it can reject it in advance if there's not enough space.
+func NewFile(name string, size int64, mode os.FileMode, r io.Reader) *File {
+	return &File{
+		Reader: r,
+		name:   name,
+		size:   size,
+		mode:   mode,
+	}
+}
+
 // IsDir will always return false.
-func (r Reader) IsDir() bool {
+func (f File) IsDir() bool {
 	return false
 }
 
 // Name returns the name of the file. It does not include the full path.
-func (r Reader) Name() string {
-	return r.name
+func (f File) Name() string {
+	return f.name
 }
 
 // Size returns the size of the file in bytes.
-func (r Reader) Size() int64 {
-	return r.size
+func (f File) Size() int64 {
+	return f.size
 }
 
 // Mode returns the mode reported by the remote side.
-func (r Reader) Mode() os.FileMode {
-	return r.mode
+func (f File) Mode() os.FileMode {
+	return f.mode
 }
 
 // ModTime returns the modification time of the file. It is currently not
 // implemented and returns a zero value.
-func (r Reader) ModTime() time.Time {
+func (f File) ModTime() time.Time {
 	return time.Time{}
 }
 
 // Sys always returns nil.
-func (r Reader) Sys() interface{} {
+func (f File) Sys() interface{} {
 	return nil
 }
 
@@ -64,7 +78,7 @@ func (r Reader) Sys() interface{} {
 // Errors that occur before the content is being read will be returned directly
 // from Read, while errors that occur during content reception will be returned
 // via the Reader (e.g. from Reader.Read).
-func Read(c *ssh.Client, file string) (*Reader, error) {
+func Read(c *ssh.Client, file string) (*File, error) {
 	s, err := c.NewSession()
 	if err != nil {
 		return nil, err
@@ -187,14 +201,93 @@ func Read(c *ssh.Client, file string) (*Reader, error) {
 		}()
 	}()
 
-	f := Reader{
-		Reader: r,
-		name:   name,
-		size:   size,
-		mode:   mode,
+	return NewFile(name, size, mode, r), nil
+}
+
+// Write writes the given File to the directory specified. It returns a list of
+// warnings and maybe an error on failure. Warnings are non-fatal, errors are
+// fatal. If there are warnings returned, they're probably important.
+func Write(c *ssh.Client, dir string, file *File) ([]string, error) {
+	s, err := c.NewSession()
+	if err != nil {
+		return nil, err
+	}
+	defer s.Close()
+
+	stdout, err := s.StdoutPipe()
+	if err != nil {
+		return nil, err
 	}
 
-	return &f, nil
+	stdin, err := s.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+
+	rw := bufio.NewReadWriter(bufio.NewReader(stdout), bufio.NewWriter(stdin))
+
+	if err := s.Start(shellquote.Join("scp", "-t", dir)); err != nil {
+		return nil, err
+	}
+
+	if _, err := rw.WriteString(fmt.Sprintf("C0%s %d %s\n", strconv.FormatUint(uint64(file.Mode()), 8), file.Size(), file.Name())); err != nil {
+		return nil, err
+	}
+	if err := rw.Flush(); err != nil {
+		return nil, err
+	}
+
+	if err := rw.WriteByte(0); err != nil {
+		return nil, err
+	}
+	if err := rw.Flush(); err != nil {
+		return nil, err
+	}
+
+	var warnings []string
+
+	if b, err := rw.ReadByte(); err != nil {
+		return nil, err
+	} else if b == 1 || b == 2 {
+		msg, err := rw.ReadString('\n')
+		if err != nil {
+			return nil, err
+		}
+
+		msg = strings.TrimSpace(msg)
+
+		if b == 2 {
+			return nil, fmt.Errorf(msg)
+		}
+
+		warnings = append(warnings, msg)
+	}
+
+	if _, err := io.Copy(rw, file); err != nil {
+		return warnings, err
+	}
+	if err := rw.Flush(); err != nil {
+		return warnings, err
+	}
+
+	if b, err := rw.ReadByte(); err != nil {
+		return nil, err
+	} else if b == 1 || b == 2 {
+		msg, err := rw.ReadString('\n')
+		if err != nil {
+			return nil, err
+		}
+
+		msg = strings.TrimSpace(msg)
+
+		if b == 2 {
+			return nil, fmt.Errorf(msg)
+		}
+
+		warnings = append(warnings, msg)
+	}
+
+	return warnings, nil
 }
 
 func min(a, b int) int {
