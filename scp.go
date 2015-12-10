@@ -237,13 +237,6 @@ func Write(c *ssh.Client, dir string, file *File) ([]string, error) {
 		return nil, err
 	}
 
-	if err := rw.WriteByte(0); err != nil {
-		return nil, err
-	}
-	if err := rw.Flush(); err != nil {
-		return nil, err
-	}
-
 	var warnings []string
 
 	if b, err := rw.ReadByte(); err != nil {
